@@ -1,0 +1,169 @@
+# Multi-state model for two states
+# ===================================
+
+# ------------
+# USER INPUTS
+# ------------
+
+# Capture history
+CAP <- read.delim("...", header=FALSE)
+# Positive disease history (same format as CH with 0s and 1s, where 1 specifies test positive at capture occasion)
+POS <- read.delim("...", header=FALSE)
+
+# ---------------
+# DATA SORTING
+# ---------------
+
+# Change to a matrix, values greater than 1 to 1 and fill NA with zeros
+CH <- CAP
+CH[CH>=1] <- 1
+CH[is.na(CH)] <- 0
+CH <- as.matrix(CH)
+
+# Ensure POS is DH (disease history)
+DH <- POS
+DH[DH>=1] <- 1
+DH[is.na(DH)] <- 0
+DH <- as.matrix(DH)
+
+# Combine CH and DH to make multi-state CMR data set, where 0=not seen, 1=seen+test negative, 2=seen+test positive.
+CH <- CH + DH
+
+# Recode CH matrix: note, such that 0 becomes 3
+# 1 = seen alive in A, 2 = seen alive in B, 3 = not seen
+rCH <- eCH          # Recoded CH
+rCH[rCH==0] <- 3
+
+# Compute vector with occasion of first capture
+get.first <- function(x) min(which(x!=0))
+f <- apply(CH, 1, get.first)
+
+sink("ms.jags")
+cat("
+    model {
+    
+    # -------------------------------------------------
+    # Parameters:
+    # phiA: survival probability of not infected
+    # phiB: survival probability of infected
+    # psiAB: transition probability from not infected to infected
+    # psiBA: transition probability from not infected to infected
+    # pA: recapture probability of not infected individuals
+    # pB: recapture probability at infected individuals
+    # -------------------------------------------------
+    # States (S):
+    # 1 alive and not infected
+    # 2 alive and infected
+    # 3 dead
+    # Observations (O):  
+    # 1 test negative
+    # 2 test positive
+    # 3 not seen
+    # -------------------------------------------------
+    
+    # Priors and constraints
+    for (t in 1:(n.occasions-1)){
+    phiA[t] <- mean.phi[1]
+    phiB[t] <- mean.phi[2]
+    psiAB[t] <- mean.psi[1]
+    psiBA[t] <- mean.psi[2]
+    pA[t] <- mean.p[1]
+    pB[t] <- mean.p[2]
+    }
+    for (u in 1:2){
+    mean.phi[u] ~ dunif(0, 1)    # Priors for mean state-spec. survival
+    mean.psi[u] ~ dunif(0, 1)    # Priors for mean transitions
+    mean.p[u] ~ dunif(0, 1)      # Priors for mean state-spec. recapture
+    }
+    
+    # Define state-transition and observation matrices
+    for (i in 1:nind){  
+    # Define probabilities of state S(t+1) given S(t)
+    for (t in f[i]:(n.occasions-1)){
+    ps[1,i,t,1] <- phiA[t] * (1-psiAB[t])
+    ps[1,i,t,2] <- phiA[t] * psiAB[t]
+    ps[1,i,t,3] <- 1-phiA[t]
+    ps[2,i,t,1] <- phiB[t] * psiBA[t]
+    ps[2,i,t,2] <- phiB[t] * (1-psiBA[t])
+    ps[2,i,t,3] <- 1-phiB[t]
+    ps[3,i,t,1] <- 0
+    ps[3,i,t,2] <- 0
+    ps[3,i,t,3] <- 1
+    
+    # Define probabilities of O(t) given S(t)
+    po[1,i,t,1] <- pA[t]
+    po[1,i,t,2] <- 0
+    po[1,i,t,3] <- 1-pA[t]
+    po[2,i,t,1] <- 0
+    po[2,i,t,2] <- pB[t]
+    po[2,i,t,3] <- 1-pB[t]
+    po[3,i,t,1] <- 0
+    po[3,i,t,2] <- 0
+    po[3,i,t,3] <- 1
+    } #t
+    } #i
+    
+    # Likelihood 
+    for (i in 1:nind){
+    # Define latent state at first capture
+    z[i,f[i]] <- y[i,f[i]]
+    for (t in (f[i]+1):n.occasions){
+    # State process: draw S(t) given S(t-1)
+    z[i,t] ~ dcat(ps[z[i,t-1], i, t-1,])
+    # Observation process: draw O(t) given S(t)
+    y[i,t] ~ dcat(po[z[i,t], i, t-1,])
+    } #t
+    } #i
+    }
+    ",fill = TRUE)
+sink()
+
+# Function to create known latent states z
+known.state.ms <- function(ms, notseen){
+  # notseen: label for ‘not seen’
+  state <- ms
+  state[state==notseen] <- NA
+  for (i in 1:dim(ms)[1]){
+    m <- min(which(!is.na(state[i,])))
+    state[i,m] <- NA
+  }
+  return(state)
+}
+
+# Function to create initial values for unknown z
+ms.init.z <- function(ch, f){
+  for (i in 1:dim(ch)[1]){ch[i,1:f[i]] <- NA}
+  states <- max(ch, na.rm = TRUE)
+  known.states <- 1:(states-1)
+  v <- which(ch==states)
+  ch[-v] <- NA
+  ch[v] <- sample(known.states, length(v), replace = TRUE)
+  return(ch)
+}
+
+# Bundle data
+jags.data <- list(y = rCH, f = f, n.occasions = dim(rCH)[2], nind = dim(rCH)[1], z = known.state.ms(rCH, 3))
+
+# Initial values
+inits <- function(){list(mean.phi = runif(2, 0, 1), mean.psi = runif(2, 0, 1), mean.p = runif(2, 0, 1), z = ms.init.z(rCH, f))}  
+
+# Parameters monitored
+parameters <- c("mean.phi", "mean.psi", "mean.p")
+
+# MCMC settings
+ni <- 10000
+nt <- 6
+nb <- 2000
+nc <- 3
+
+# Call JAGS from R (BRT 8 min)
+ms <- jags(jags.data, inits, parameters, "ms.jags", n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb, working.directory = getwd())
+print(ms, digits = 3)
+
+par(mfrow = c(3, 2), las = 1)
+hist(ms$BUGSoutput$sims.list$mean.phi[,1], col = "gray", main = "", xlab = expression(phi[A]), ylim=c(0,1300))
+hist(ms$BUGSoutput$sims.list$mean.phi[,2], col = "gray", main = "", xlab = expression(phi[B]), ylim=c(0,1300), ylab="")
+hist(ms$BUGSoutput$sims.list$mean.psi[,1], col = "gray", main = "", xlab = expression(psi[AB]), ylim=c(0,1300))
+hist(ms$BUGSoutput$sims.list$mean.psi[,2], col = "gray", main = "", xlab = expression(psi[BA]), ylab="", ylim=c(0,1300))
+hist(ms$BUGSoutput$sims.list$mean.p[,1], col = "gray", main = "", xlab = expression(p[A]), ylim=c(0,1300))
+hist(ms$BUGSoutput$sims.list$mean.p[,2], col = "gray", main = "", xlab = expression(p[B]), ylab="", ylim=c(0,1300))
