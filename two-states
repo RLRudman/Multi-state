@@ -1,5 +1,7 @@
 # Multi-state model for two states
 # ===================================
+# Important: this model does not have a 'group' factor and therefore can not model both sexes.
+#   Therefore it can only be used for a single sex, or if any sex effect is going to be ignored.
 
 # ------------
 # USER INPUTS
